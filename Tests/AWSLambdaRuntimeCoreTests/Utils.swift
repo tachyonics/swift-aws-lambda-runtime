@@ -25,7 +25,7 @@ func runLambda<Handler: SimpleLambdaHandler>(behavior: LambdaServerBehavior, han
 func runLambda<Handler: LambdaHandler>(behavior: LambdaServerBehavior, handlerType: Handler.Type) throws {
     try runLambda(behavior: behavior, handlerProvider: CodableLambdaHandler<Handler>.makeHandler(context:))
 }
-
+/*
 func runLambda<Handler: EventLoopLambdaHandler>(behavior: LambdaServerBehavior, handlerType: Handler.Type) throws {
     try runLambda(behavior: behavior, handlerProvider: CodableEventLoopLambdaHandler<Handler>.makeHandler(context:))
 }
@@ -50,7 +50,7 @@ func runLambda<Handler: EventLoopLambdaHandler>(
         return CodableEventLoopLambdaHandler(handler: handler, allocator: context.allocator)
     })
 }
-
+*/
 func runLambda<Handler: ByteBufferLambdaHandler>(
     behavior: LambdaServerBehavior,
     handlerProvider: @escaping (LambdaInitializationContext) async throws -> Handler
@@ -70,19 +70,17 @@ func runLambda<Handler: ByteBufferLambdaHandler>(
 
 func runLambda(
     behavior: LambdaServerBehavior,
-    handlerProvider: @escaping (LambdaInitializationContext) -> EventLoopFuture<some ByteBufferLambdaHandler>
-) throws {
-    let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-    defer { XCTAssertNoThrow(try eventLoopGroup.syncShutdownGracefully()) }
+    handlerProvider: @escaping (LambdaInitializationContext) async -> some ByteBufferLambdaHandler
+) async throws {
     let logger = Logger(label: "TestLogger")
     let configuration = LambdaConfiguration(runtimeEngine: .init(requestTimeout: .milliseconds(100)))
     let terminator = LambdaTerminator()
-    let runner = LambdaRunner(eventLoop: eventLoopGroup.next(), configuration: configuration)
+    let runner = LambdaRunner(configuration: configuration)
     let server = try MockLambdaServer(behavior: behavior).start().wait()
     defer { XCTAssertNoThrow(try server.stop().wait()) }
-    try runner.initialize(handlerProvider: handlerProvider, logger: logger, terminator: terminator).flatMap { handler in
-        runner.run(handler: handler, logger: logger)
-    }.wait()
+    
+    let handler = try await runner.initialize(handlerProvider: handlerProvider, logger: logger, terminator: terminator)
+    try await runner.run(handler: handler, logger: logger)
 }
 
 func assertLambdaRuntimeResult(_ result: Result<Int, Error>, shouldHaveRun: Int = 0, shouldFailWithError: Error? = nil, file: StaticString = #file, line: UInt = #line) {

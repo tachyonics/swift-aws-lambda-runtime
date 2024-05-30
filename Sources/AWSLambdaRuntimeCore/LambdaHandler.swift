@@ -15,6 +15,35 @@
 import Dispatch
 import NIOCore
 
+// MARK: - SimpleTypedResponseWriter
+
+public struct SimpleTypedResponseWriter<UnderlyingHandler: SimpleLambdaHandler, UnderlyingWriter: ResponseWriter<ByteBuffer?> & ~Copyable>: ResponseWriter, ~Copyable {
+    @usableFromInline
+    var writer: UnderlyingWriter
+    @usableFromInline
+    let handler: UnderlyingHandler
+    @usableFromInline
+    private(set) var outputBuffer: ByteBuffer
+    
+    @inlinable
+    init(handler: UnderlyingHandler, writer: consuming UnderlyingWriter, outputBuffer: ByteBuffer) {
+        self.writer = writer
+        self.handler = handler
+        self.outputBuffer = outputBuffer
+    }
+    
+    public mutating func submit(value: UnderlyingHandler.Output) async throws {
+        var outputBuffer = self.outputBuffer
+        try self.handler.encode(value: value, into: &outputBuffer)
+        
+        try await self.writer.submit(value: outputBuffer)
+    }
+    
+    public mutating func submit(error: Swift.Error) async throws {
+        try await self.writer.submit(error: error)
+    }
+}
+
 // MARK: - SimpleLambdaHandler
 
 /// Strongly typed, processing protocol for a Lambda that takes a user defined
@@ -39,9 +68,10 @@ public protocol SimpleLambdaHandler {
     /// - parameters:
     ///     - event: Event of type `Event` representing the event or request.
     ///     - context: Runtime ``LambdaContext``.
+    ///     - responseWriter: Typed response writer to return the response to the caller.
     ///
     /// - Returns: A Lambda result ot type `Output`.
-    func handle(_ event: Event, context: LambdaContext) async throws -> Output
+    func handle(_ event: Event, context: LambdaContext, responseWriter: inout some (ResponseWriter<Output> & ~Copyable)) async throws
 
     /// Encode a response of type ``Output`` to `ByteBuffer`.
     /// Concrete Lambda handlers implement this method to provide coding functionality.
@@ -70,13 +100,9 @@ final class CodableSimpleLambdaHandler<Underlying: SimpleLambdaHandler>: ByteBuf
     private(set) var outputBuffer: ByteBuffer
 
     @inlinable
-    static func makeHandler(context: LambdaInitializationContext) -> EventLoopFuture<CodableSimpleLambdaHandler> {
-        let promise = context.eventLoop.makePromise(of: CodableSimpleLambdaHandler<Underlying>.self)
-        promise.completeWithTask {
-            let handler = Underlying()
-            return CodableSimpleLambdaHandler(handler: handler, allocator: context.allocator)
-        }
-        return promise.futureResult
+    static func makeHandler(context: LambdaInitializationContext) async throws -> CodableSimpleLambdaHandler {
+        let handler = Underlying()
+        return CodableSimpleLambdaHandler(handler: handler, allocator: context.allocator)
     }
 
     @inlinable
@@ -86,27 +112,28 @@ final class CodableSimpleLambdaHandler<Underlying: SimpleLambdaHandler>: ByteBuf
     }
 
     @inlinable
-    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?> {
-        let promise = context.eventLoop.makePromise(of: ByteBuffer?.self)
-        promise.completeWithTask {
-            let input: Underlying.Event
-            do {
-                input = try self.handler.decode(buffer: buffer)
-            } catch {
-                throw CodecError.requestDecoding(error)
-            }
-
-            let output = try await self.handler.handle(input, context: context)
-
-            do {
-                self.outputBuffer.clear()
-                try self.handler.encode(value: output, into: &self.outputBuffer)
-                return self.outputBuffer
-            } catch {
-                throw CodecError.responseEncoding(error)
-            }
+    func handle(_ buffer: ByteBuffer, context: LambdaContext, responseWriter: inout some (ResponseWriter<ByteBuffer?> & ~Copyable)) async throws {
+        let input: Underlying.Event
+        do {
+            input = try self.handler.decode(buffer: buffer)
+        } catch {
+            throw CodecError.requestDecoding(error)
         }
-        return promise.futureResult
+        
+        self.outputBuffer.clear()
+        // create a typed response writer, consuming `responseWriter`
+        var typedResponseWriter = SimpleTypedResponseWriter(handler: self.handler, writer: responseWriter, outputBuffer: self.outputBuffer)
+        
+        do {
+            try await self.handler.handle(input, context: context, responseWriter: &typedResponseWriter)
+        } catch {
+            // rethrow the error after restoring`responseWriter` which was consumed by `typedResponseWriter`
+            responseWriter = typedResponseWriter.writer
+            throw error
+        }
+        
+        // restore `responseWriter` which was consumed by `typedResponseWriter`
+        responseWriter = typedResponseWriter.writer
     }
 }
 
@@ -125,8 +152,37 @@ extension SimpleLambdaHandler {
     ///
     /// The lambda runtime provides a default implementation of the method that manages the launch
     /// process.
-    public static func main() {
-        _ = Lambda.run(configuration: .init(), handlerType: Self.self)
+    public static func main() async {
+        _ = await Lambda.run(configuration: .init(), handlerType: Self.self)
+    }
+}
+
+// MARK: - TypedResponseWriter
+
+public struct TypedResponseWriter<UnderlyingHandler: LambdaHandler, UnderlyingWriter: ResponseWriter<ByteBuffer?> & ~Copyable>: ResponseWriter, ~Copyable {
+    @usableFromInline
+    var writer: UnderlyingWriter
+    @usableFromInline
+    let handler: UnderlyingHandler
+    @usableFromInline
+    private(set) var outputBuffer: ByteBuffer
+    
+    @inlinable
+    init(handler: UnderlyingHandler, writer: consuming UnderlyingWriter, outputBuffer: ByteBuffer) {
+        self.writer = writer
+        self.handler = handler
+        self.outputBuffer = outputBuffer
+    }
+    
+    public mutating func submit(value: UnderlyingHandler.Output) async throws {
+        var outputBuffer = self.outputBuffer
+        try self.handler.encode(value: value, into: &outputBuffer)
+        
+        try await self.writer.submit(value: outputBuffer)
+    }
+    
+    public mutating func submit(error: Swift.Error) async throws {
+        try await self.writer.submit(error: error)
     }
 }
 
@@ -161,9 +217,10 @@ public protocol LambdaHandler {
     /// - parameters:
     ///     - event: Event of type `Event` representing the event or request.
     ///     - context: Runtime ``LambdaContext``.
+    ///     - responseWriter: Typed response writer to return the response to the caller.
     ///
     /// - Returns: A Lambda result ot type `Output`.
-    func handle(_ event: Event, context: LambdaContext) async throws -> Output
+    func handle(_ event: Event, context: LambdaContext, responseWriter: inout some (ResponseWriter<Output> & ~Copyable)) async throws
 
     /// Encode a response of type ``Output`` to `ByteBuffer`.
     /// Concrete Lambda handlers implement this method to provide coding functionality.
@@ -192,13 +249,9 @@ final class CodableLambdaHandler<Underlying: LambdaHandler>: ByteBufferLambdaHan
     private(set) var outputBuffer: ByteBuffer
 
     @inlinable
-    static func makeHandler(context: LambdaInitializationContext) -> EventLoopFuture<CodableLambdaHandler> {
-        let promise = context.eventLoop.makePromise(of: CodableLambdaHandler<Underlying>.self)
-        promise.completeWithTask {
-            let handler = try await Underlying(context: context)
-            return CodableLambdaHandler(handler: handler, allocator: context.allocator)
-        }
-        return promise.futureResult
+    static func makeHandler(context: LambdaInitializationContext) async throws -> CodableLambdaHandler {
+        let handler = try await Underlying(context: context)
+        return CodableLambdaHandler(handler: handler, allocator: context.allocator)
     }
 
     @inlinable
@@ -208,27 +261,28 @@ final class CodableLambdaHandler<Underlying: LambdaHandler>: ByteBufferLambdaHan
     }
 
     @inlinable
-    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?> {
-        let promise = context.eventLoop.makePromise(of: ByteBuffer?.self)
-        promise.completeWithTask {
-            let input: Underlying.Event
-            do {
-                input = try self.handler.decode(buffer: buffer)
-            } catch {
-                throw CodecError.requestDecoding(error)
-            }
-
-            let output = try await self.handler.handle(input, context: context)
-
-            do {
-                self.outputBuffer.clear()
-                try self.handler.encode(value: output, into: &self.outputBuffer)
-                return self.outputBuffer
-            } catch {
-                throw CodecError.responseEncoding(error)
-            }
+    func handle(_ buffer: ByteBuffer, context: LambdaContext, responseWriter: inout some (ResponseWriter<ByteBuffer?> & ~Copyable)) async throws {
+        let input: Underlying.Event
+        do {
+            input = try self.handler.decode(buffer: buffer)
+        } catch {
+            throw CodecError.requestDecoding(error)
         }
-        return promise.futureResult
+        
+        self.outputBuffer.clear()
+        // create a typed response writer, consuming `responseWriter`
+        var typedResponseWriter = TypedResponseWriter(handler: self.handler, writer: responseWriter, outputBuffer: self.outputBuffer)
+        
+        do {
+            try await self.handler.handle(input, context: context, responseWriter: &typedResponseWriter)
+        } catch {
+            // rethrow the error after restoring`responseWriter` which was consumed by `typedResponseWriter`
+            responseWriter = typedResponseWriter.writer
+            throw error
+        }
+        
+        // restore `responseWriter` which was consumed by `typedResponseWriter`
+        responseWriter = typedResponseWriter.writer
     }
 }
 
@@ -247,8 +301,8 @@ extension LambdaHandler {
     ///
     /// The lambda runtime provides a default implementation of the method that manages the launch
     /// process.
-    public static func main() {
-        _ = Lambda.run(configuration: .init(), handlerType: Self.self)
+    public static func main() async {
+        _ = await Lambda.run(configuration: .init(), handlerType: Self.self)
     }
 }
 
@@ -265,13 +319,13 @@ internal struct UncheckedSendableHandler<Underlying: LambdaHandler, Event, Outpu
     }
 
     @inlinable
-    func handle(_ event: Event, context: LambdaContext) async throws -> Output {
-        try await self.underlying.handle(event, context: context)
+    func handle(_ event: Event, context: LambdaContext, responseWriter: inout some (ResponseWriter<Output> & ~Copyable)) async throws {
+        try await self.underlying.handle(event, context: context, responseWriter: &responseWriter)
     }
 }
 
 // MARK: - EventLoopLambdaHandler
-
+/*
 /// Strongly typed, `EventLoopFuture` based processing protocol for a Lambda that takes a user
 /// defined ``EventLoopLambdaHandler/Event`` and returns a user defined ``EventLoopLambdaHandler/Output`` asynchronously.
 ///
@@ -356,7 +410,7 @@ final class CodableEventLoopLambdaHandler<Underlying: EventLoopLambdaHandler>: B
     }
 
     @inlinable
-    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?> {
+    func handle(_ buffer: ByteBuffer, context: LambdaContext, responseWriter: inout some (ResponseWriter<ByteBuffer?> & ~Copyable)) async throws {
         let input: Underlying.Event
         do {
             input = try self.handler.decode(buffer: buffer)
@@ -389,7 +443,7 @@ extension EventLoopLambdaHandler {
         _ = Lambda.run(configuration: .init(), handlerType: Self.self)
     }
 }
-
+*/
 // MARK: - ByteBufferLambdaHandler
 
 /// An `EventLoopFuture` based processing protocol for a Lambda that takes a `ByteBuffer` and returns
@@ -405,7 +459,7 @@ public protocol ByteBufferLambdaHandler: LambdaRuntimeHandler {
     /// connections and HTTP clients for example. It is encouraged to use the given `EventLoop`'s conformance
     /// to `EventLoopGroup` when initializing NIO dependencies. This will improve overall performance, as it
     /// minimizes thread hopping.
-    static func makeHandler(context: LambdaInitializationContext) -> EventLoopFuture<Self>
+    static func makeHandler(context: LambdaInitializationContext) async throws -> Self
 
     /// The Lambda handling method.
     /// Concrete Lambda handlers implement this method to provide the Lambda functionality.
@@ -413,10 +467,10 @@ public protocol ByteBufferLambdaHandler: LambdaRuntimeHandler {
     /// - parameters:
     ///     - context: Runtime ``LambdaContext``.
     ///     - event: The event or input payload encoded as `ByteBuffer`.
+    ///     - responseWriter: writer that returns response encoded as `ByteBuffer` to the caller.
     ///
-    /// - Returns: An `EventLoopFuture` to report the result of the Lambda back to the runtime engine.
-    ///            The `EventLoopFuture` should be completed with either a response encoded as `ByteBuffer` or an `Error`.
-    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?>
+    /// - Throws: An `Error` response to return to the caller.
+    func handle(_ buffer: ByteBuffer, context: LambdaContext, responseWriter: inout some (ResponseWriter<ByteBuffer?> & ~Copyable)) async throws
 }
 
 extension ByteBufferLambdaHandler {
@@ -428,9 +482,19 @@ extension ByteBufferLambdaHandler {
     ///
     /// The lambda runtime provides a default implementation of the method that manages the launch
     /// process.
-    public static func main() {
-        _ = Lambda.run(configuration: .init(), handlerType: Self.self)
+    public static func main() async {
+        _ = await Lambda.run(configuration: .init(), handlerType: Self.self)
     }
+}
+
+// MARK: - ResponseWriter
+
+public protocol ResponseWriter<Output>: ~Copyable {
+    associatedtype Output
+    
+    mutating func submit(value: Output) async throws
+    
+    mutating func submit(error: Swift.Error) async throws
 }
 
 // MARK: - LambdaRuntimeHandler
@@ -449,10 +513,10 @@ public protocol LambdaRuntimeHandler {
     /// - parameters:
     ///     - context: Runtime ``LambdaContext``.
     ///     - event: The event or input payload encoded as `ByteBuffer`.
+    ///     - responseWriter: writer that returns response encoded as `ByteBuffer` to the caller.
     ///
-    /// - Returns: An `EventLoopFuture` to report the result of the Lambda back to the runtime engine.
-    ///            The `EventLoopFuture` should be completed with either a response encoded as `ByteBuffer` or an `Error`.
-    func handle(_ buffer: ByteBuffer, context: LambdaContext) -> EventLoopFuture<ByteBuffer?>
+    /// - Throws: An `Error` response to return to the caller.
+    func handle(_ buffer: ByteBuffer, context: LambdaContext, responseWriter: inout some (ResponseWriter<ByteBuffer?> & ~Copyable)) async throws
 }
 
 // MARK: - Other

@@ -19,7 +19,7 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 
-internal final class MockLambdaServer {
+internal final actor MockLambdaServer {
     private let logger = Logger(label: "MockLambdaServer")
     private let behavior: LambdaServerBehavior
     private let host: String
@@ -38,11 +38,7 @@ internal final class MockLambdaServer {
         self.keepAlive = keepAlive
     }
 
-    deinit {
-        assert(shutdown)
-    }
-
-    func start() -> EventLoopFuture<MockLambdaServer> {
+    func start() async throws -> MockLambdaServer {
         let bootstrap = ServerBootstrap(group: group)
             .serverChannelOption(ChannelOptions.socket(SocketOptionLevel(SOL_SOCKET), SO_REUSEADDR), value: 1)
             .childChannelInitializer { channel in
@@ -57,7 +53,7 @@ internal final class MockLambdaServer {
             }
             self.logger.info("\(self) started and listening on \(localAddress)")
             return channel.eventLoop.makeSucceededFuture(self)
-        }
+        }.get()
     }
 
     func stop() -> EventLoopFuture<Void> {

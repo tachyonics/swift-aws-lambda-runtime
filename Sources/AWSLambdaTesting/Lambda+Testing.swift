@@ -40,6 +40,37 @@ import Logging
 import NIOCore
 import NIOPosix
 
+struct TestResponseWriter<Output>: ~Copyable, ResponseWriter {
+    
+    private var output: Result<Output, Swift.Error>?
+    
+    init() {
+    }
+    
+    var value: Output {
+        get throws {
+            guard let output = self.output else {
+                fatalError("Response not set")
+            }
+            
+            switch output {
+            case .success(let value):
+                return value
+            case .failure(let error):
+                throw error
+            }
+        }
+    }
+    
+    mutating func submit(value: Output) async {
+        self.output = .success(value)
+    }
+    
+    mutating func submit(error: Swift.Error) async {
+        self.output = .failure(error)
+    }
+}
+
 extension Lambda {
     public struct TestConfig {
         public var requestID: String
@@ -65,7 +96,10 @@ extension Lambda {
     ) async throws -> Handler.Output {
         let context = Self.makeContext(config: config)
         let handler = Handler()
-        return try await handler.handle(event, context: context.1)
+        var responseHandler = TestResponseWriter<Handler.Output>()
+        try await handler.handle(event, context: context.1, responseWriter: &responseHandler)
+        
+        return try responseHandler.value
     }
 
     public static func test<Handler: LambdaHandler>(
@@ -75,9 +109,12 @@ extension Lambda {
     ) async throws -> Handler.Output {
         let context = Self.makeContext(config: config)
         let handler = try await Handler(context: context.0)
-        return try await handler.handle(event, context: context.1)
+        var responseHandler = TestResponseWriter<Handler.Output>()
+        try await handler.handle(event, context: context.1, responseWriter: &responseHandler)
+        
+        return try responseHandler.value
     }
-
+/*
     public static func test<Handler: EventLoopLambdaHandler>(
         _ handlerType: Handler.Type,
         with event: Handler.Event,
@@ -87,29 +124,25 @@ extension Lambda {
         let handler = try await Handler.makeHandler(context: context.0).get()
         return try await handler.handle(event, context: context.1).get()
     }
-
+*/
     public static func test<Handler: ByteBufferLambdaHandler>(
         _ handlerType: Handler.Type,
         with buffer: ByteBuffer,
         using config: TestConfig = .init()
     ) async throws -> ByteBuffer? {
         let context = Self.makeContext(config: config)
-        let handler = try await Handler.makeHandler(context: context.0).get()
-        return try await handler.handle(buffer, context: context.1).get()
+        let handler = try await Handler.makeHandler(context: context.0)
+        var responseHandler = TestResponseWriter<ByteBuffer?>()
+        try await handler.handle(buffer, context: context.1, responseWriter: &responseHandler)
+        
+        return try responseHandler.value
     }
 
     private static func makeContext(config: TestConfig) -> (LambdaInitializationContext, LambdaContext) {
         let logger = Logger(label: "test")
 
-        let eventLoopGroup = MultiThreadedEventLoopGroup(numberOfThreads: 1)
-        defer {
-            try! eventLoopGroup.syncShutdownGracefully()
-        }
-        let eventLoop = eventLoopGroup.next()
-
         let initContext = LambdaInitializationContext.__forTestsOnly(
-            logger: logger,
-            eventLoop: eventLoop
+            logger: logger
         )
 
         let context = LambdaContext.__forTestsOnly(
@@ -117,8 +150,7 @@ extension Lambda {
             traceID: config.traceID,
             invokedFunctionARN: config.invokedFunctionARN,
             timeout: config.timeout,
-            logger: logger,
-            eventLoop: eventLoop
+            logger: logger
         )
 
         return (initContext, context)

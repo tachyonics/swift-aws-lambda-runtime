@@ -15,6 +15,7 @@
 import Dispatch
 import Logging
 import NIOCore
+import NIOPosix
 
 internal struct LambdaConfiguration: CustomStringConvertible {
     let general: General
@@ -64,8 +65,10 @@ internal struct LambdaConfiguration: CustomStringConvertible {
         let ip: String
         let port: Int
         let requestTimeout: TimeAmount?
+        let eventLoop: EventLoop
 
-        init(address: String? = nil, keepAlive: Bool? = nil, requestTimeout: TimeAmount? = nil) {
+        init(address: String? = nil, keepAlive: Bool? = nil, requestTimeout: TimeAmount? = nil,
+             eventLoop: EventLoop = MultiThreadedEventLoopGroup.singleton.any()) {
             let ipPort = (address ?? Lambda.env("AWS_LAMBDA_RUNTIME_API"))?.split(separator: ":") ?? ["127.0.0.1", "7000"]
             guard ipPort.count == 2, let port = Int(ipPort[1]) else {
                 preconditionFailure("invalid ip+port configuration \(ipPort)")
@@ -73,6 +76,7 @@ internal struct LambdaConfiguration: CustomStringConvertible {
             self.ip = String(ipPort[0])
             self.port = port
             self.requestTimeout = requestTimeout ?? Lambda.env("REQUEST_TIMEOUT").flatMap(Int64.init).flatMap { .milliseconds($0) }
+            self.eventLoop = eventLoop
         }
 
         var description: String {

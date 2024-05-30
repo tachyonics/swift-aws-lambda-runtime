@@ -56,7 +56,7 @@ extension LambdaHandler where Output == String {
 }
 
 // MARK: - EventLoopLambdaHandler String support
-
+/*
 extension EventLoopLambdaHandler where Event == String {
     /// Implementation of `String` to `ByteBuffer` encoding.
     @inlinable
@@ -75,3 +75,4 @@ extension EventLoopLambdaHandler where Output == String {
         buffer.writeString(value)
     }
 }
+*/

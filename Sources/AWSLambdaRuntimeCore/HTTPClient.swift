@@ -34,21 +34,21 @@ internal final class HTTPClient {
         self.targetHost = "\(self.configuration.ip):\(self.configuration.port)"
     }
 
-    func get(url: String, headers: HTTPHeaders, timeout: TimeAmount? = nil) -> EventLoopFuture<Response> {
-        self.execute(Request(targetHost: self.targetHost,
-                             url: url,
-                             method: .GET,
-                             headers: headers,
-                             timeout: timeout ?? self.configuration.requestTimeout))
+    func get(url: String, headers: HTTPHeaders, timeout: TimeAmount? = nil) async throws -> Response {
+        try await self.execute(Request(targetHost: self.targetHost,
+                                       url: url,
+                                       method: .GET,
+                                       headers: headers,
+                                       timeout: timeout ?? self.configuration.requestTimeout)).get()
     }
 
-    func post(url: String, headers: HTTPHeaders, body: ByteBuffer?, timeout: TimeAmount? = nil) -> EventLoopFuture<Response> {
-        self.execute(Request(targetHost: self.targetHost,
-                             url: url,
-                             method: .POST,
-                             headers: headers,
-                             body: body,
-                             timeout: timeout ?? self.configuration.requestTimeout))
+    func post(url: String, headers: HTTPHeaders, body: ByteBuffer?, timeout: TimeAmount? = nil) async throws -> Response {
+        try await self.execute(Request(targetHost: self.targetHost,
+                                       url: url,
+                                       method: .POST,
+                                       headers: headers,
+                                       body: body,
+                                       timeout: timeout ?? self.configuration.requestTimeout)).get()
     }
 
     /// cancels the current request if there is one

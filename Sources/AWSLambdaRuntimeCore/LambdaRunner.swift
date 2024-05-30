@@ -16,17 +16,72 @@ import Dispatch
 import Logging
 import NIOCore
 
+private struct ByteBufferResponseWriter: ~Copyable, ResponseWriter {
+    typealias Output = ByteBuffer?
+    
+    private let invocation: Invocation
+    private let runtimeClient: LambdaRuntimeClient
+    private let logger: Logger
+    private var state: State
+    
+    private enum State {
+        case initialized
+        case finalized
+    }
+    
+    init(invocation: Invocation, runtimeClient: LambdaRuntimeClient, logger: Logger) {
+        self.invocation = invocation
+        self.runtimeClient = runtimeClient
+        self.logger = logger
+        self.state = .initialized
+    }
+    
+    private mutating func reportResults(_ result: Result<ByteBuffer?, Error>) async {
+        // 3. report results to runtime engine
+        do {
+            try await self.runtimeClient.reportResults(logger: logger, invocation: invocation, result: result)
+        } catch {
+            logger.error("could not report results to lambda runtime engine: \(error)")
+        }
+        
+        state = .finalized
+    }
+    
+    internal mutating func finalizeIfRequired() async {
+        guard case .initialized = state else {
+            return
+        }
+
+        await reportResults(.success(nil))
+    }
+    
+    mutating func submit(value: ByteBuffer?) async {
+        guard case .initialized = state else {
+            fatalError("Response provided multiple times.")
+        }
+
+        await reportResults(.success(value))
+    }
+    
+    mutating func submit(error: Swift.Error) async {
+        guard case .initialized = state else {
+            fatalError("Response provided multiple times.")
+        }
+        
+        logger.warning("lambda handler returned an error: \(error)")
+        await reportResults(.failure(error))
+    }
+}
+
 /// LambdaRunner manages the Lambda runtime workflow, or business logic.
 internal final class LambdaRunner {
     private let runtimeClient: LambdaRuntimeClient
-    private let eventLoop: EventLoop
     private let allocator: ByteBufferAllocator
 
     private var isGettingNextInvocation = false
 
-    init(eventLoop: EventLoop, configuration: LambdaConfiguration) {
-        self.eventLoop = eventLoop
-        self.runtimeClient = LambdaRuntimeClient(eventLoop: self.eventLoop, configuration: configuration.runtimeEngine)
+    init(configuration: LambdaConfiguration) {
+        self.runtimeClient = LambdaRuntimeClient(configuration: configuration.runtimeEngine)
         self.allocator = ByteBufferAllocator()
     }
 
@@ -34,74 +89,73 @@ internal final class LambdaRunner {
     ///
     /// - Returns: An `EventLoopFuture<LambdaHandler>` fulfilled with the outcome of the initialization.
     func initialize<Handler: LambdaRuntimeHandler>(
-        handlerProvider: @escaping (LambdaInitializationContext) -> EventLoopFuture<Handler>,
+        handlerProvider: @escaping (LambdaInitializationContext) async throws -> Handler,
         logger: Logger,
         terminator: LambdaTerminator
-    ) -> EventLoopFuture<Handler> {
+    ) async throws -> Handler {
         logger.debug("initializing lambda")
         // 1. create the handler from the factory
         // 2. report initialization error if one occurred
         let context = LambdaInitializationContext(
             logger: logger,
-            eventLoop: self.eventLoop,
             allocator: self.allocator,
             terminator: terminator
         )
-
-        return handlerProvider(context)
-            // Hopping back to "our" EventLoop is important in case the factory returns a future
-            // that originated from a foreign EventLoop/EventLoopGroup.
-            // This can happen if the factory uses a library (let's say a database client) that manages its own threads/loops
-            // for whatever reason and returns a future that originated from that foreign EventLoop.
-            .hop(to: self.eventLoop)
-            .peekError { error in
-                self.runtimeClient.reportInitializationError(logger: logger, error: error).peekError { reportingError in
-                    // We're going to bail out because the init failed, so there's not a lot we can do other than log
-                    // that we couldn't report this error back to the runtime.
-                    logger.error("failed reporting initialization error to lambda runtime engine: \(reportingError)")
-                }
+        
+        do {
+            return try await handlerProvider(context)
+        } catch {
+            do {
+                try await self.runtimeClient.reportInitializationError(logger: logger, error: error)
+            } catch let reportingError {
+                // We're going to bail out because the init failed, so there's not a lot we can do other than log
+                // that we couldn't report this error back to the runtime.
+                logger.error("failed reporting initialization error to lambda runtime engine: \(reportingError)")
+                
+                throw error
             }
+            throw error
+        }
     }
 
-    func run(handler: some LambdaRuntimeHandler, logger: Logger) -> EventLoopFuture<Void> {
+    func run(handler: some LambdaRuntimeHandler, logger: Logger) async throws {
         logger.debug("lambda invocation sequence starting")
         // 1. request invocation from lambda runtime engine
         self.isGettingNextInvocation = true
-        return self.runtimeClient.getNextInvocation(logger: logger).peekError { error in
+        
+        let invocation: Invocation
+        let bytes: ByteBuffer
+        do {
+            (invocation, bytes) = try await self.runtimeClient.getNextInvocation(logger: logger)
+        } catch {
             logger.debug("could not fetch work from lambda runtime engine: \(error)")
-        }.flatMap { invocation, bytes in
-            // 2. send invocation to handler
-            self.isGettingNextInvocation = false
-            let context = LambdaContext(
-                logger: logger,
-                eventLoop: self.eventLoop,
-                allocator: self.allocator,
-                invocation: invocation
-            )
-            // when log level is trace or lower, print the first Kb of the payload
-            if logger.logLevel <= .trace, let buffer = bytes.getSlice(at: 0, length: max(bytes.readableBytes, 1024)) {
-                logger.trace("sending invocation to lambda handler",
-                             metadata: ["1024 first bytes": .string(String(buffer: buffer))])
-            } else {
-                logger.debug("sending invocation to lambda handler")
-            }
-            return handler.handle(bytes, context: context)
-                // Hopping back to "our" EventLoop is important in case the handler returns a future that
-                // originated from a foreign EventLoop/EventLoopGroup.
-                // This can happen if the handler uses a library (lets say a DB client) that manages its own threads/loops
-                // for whatever reason and returns a future that originated from that foreign EventLoop.
-                .hop(to: self.eventLoop)
-                .mapResult { result in
-                    if case .failure(let error) = result {
-                        logger.warning("lambda handler returned an error: \(error)")
-                    }
-                    return (invocation, result)
-                }
-        }.flatMap { invocation, result in
-            // 3. report results to runtime engine
-            self.runtimeClient.reportResults(logger: logger, invocation: invocation, result: result).peekError { error in
-                logger.error("could not report results to lambda runtime engine: \(error)")
-            }
+            
+            throw error
+        }
+        
+        // 2. send invocation to handler
+        self.isGettingNextInvocation = false
+        let context = LambdaContext(
+            logger: logger,
+            allocator: self.allocator,
+            invocation: invocation
+        )
+        // when log level is trace or lower, print the first Kb of the payload
+        if logger.logLevel <= .trace, let buffer = bytes.getSlice(at: 0, length: max(bytes.readableBytes, 1024)) {
+            logger.trace("sending invocation to lambda handler",
+                         metadata: ["1024 first bytes": .string(String(buffer: buffer))])
+        } else {
+            logger.debug("sending invocation to lambda handler")
+        }
+        
+        var responseWriter = ByteBufferResponseWriter(invocation: invocation, runtimeClient: self.runtimeClient, logger: logger)
+        
+        do {
+            try await handler.handle(bytes, context: context, responseWriter: &responseWriter)
+            
+            await responseWriter.finalizeIfRequired()
+        } catch {
+            await responseWriter.submit(error: error)
         }
     }
 
@@ -115,7 +169,7 @@ internal final class LambdaRunner {
 }
 
 extension LambdaContext {
-    init(logger: Logger, eventLoop: EventLoop, allocator: ByteBufferAllocator, invocation: Invocation) {
+    init(logger: Logger, allocator: ByteBufferAllocator, invocation: Invocation) {
         self.init(requestID: invocation.requestID,
                   traceID: invocation.traceID,
                   invokedFunctionARN: invocation.invokedFunctionARN,
@@ -123,11 +177,10 @@ extension LambdaContext {
                   cognitoIdentity: invocation.cognitoIdentity,
                   clientContext: invocation.clientContext,
                   logger: logger,
-                  eventLoop: eventLoop,
                   allocator: allocator)
     }
 }
-
+/*
 // TODO: move to nio?
 extension EventLoopFuture {
     // callback does not have side effects, failing with original result
@@ -157,7 +210,7 @@ extension EventLoopFuture {
         }
     }
 }
-
+*/
 extension Result {
     private var successful: Bool {
         switch self {

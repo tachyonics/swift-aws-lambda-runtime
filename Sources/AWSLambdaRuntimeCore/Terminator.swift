@@ -17,8 +17,8 @@ import NIOCore
 
 /// Lambda terminator.
 /// Utility to manage the lambda shutdown sequence.
-public final class LambdaTerminator {
-    fileprivate typealias Handler = (EventLoop) -> EventLoopFuture<Void>
+public struct LambdaTerminator: Sendable {
+    fileprivate typealias Handler = @Sendable () async throws -> Void
 
     private var storage: Storage
 
@@ -35,9 +35,9 @@ public final class LambdaTerminator {
     ///
     /// - Returns: A ``RegistrationKey`` that can be used to de-register the handler when its no longer needed.
     @discardableResult
-    public func register(name: String, handler: @escaping (EventLoop) -> EventLoopFuture<Void>) -> RegistrationKey {
+    public func register(name: String, handler: @escaping @Sendable () async throws -> Void) async -> RegistrationKey {
         let key = RegistrationKey()
-        self.storage.add(key: key, name: name, handler: handler)
+        await self.storage.add(key: key, name: name, handler: handler)
         return key
     }
 
@@ -45,46 +45,31 @@ public final class LambdaTerminator {
     ///
     /// - parameters:
     ///     - key: A ``RegistrationKey`` obtained from calling the register API.
-    public func deregister(_ key: RegistrationKey) {
-        self.storage.remove(key)
+    public func deregister(_ key: RegistrationKey) async {
+        await self.storage.remove(key)
     }
 
     /// Begin the termination cycle.
     /// Shutdown handlers are called in the reverse order of being registered.
-    ///
-    /// - parameters:
-    ///     - eventLoop: The `EventLoop` to run the termination on.
-    ///
-    /// - Returns: An `EventLoopFuture` with the result of the termination cycle.
-    internal func terminate(eventLoop: EventLoop) -> EventLoopFuture<Void> {
-        func terminate(_ iterator: IndexingIterator<[(name: String, handler: Handler)]>, errors: [Error], promise: EventLoopPromise<Void>) {
-            var iterator = iterator
-            guard let handler = iterator.next()?.handler else {
-                if errors.isEmpty {
-                    return promise.succeed(())
-                } else {
-                    return promise.fail(TerminationError(underlying: errors))
-                }
-            }
-            handler(eventLoop).whenComplete { result in
-                var errors = errors
-                if case .failure(let error) = result {
-                    errors.append(error)
-                }
-                return terminate(iterator, errors: errors, promise: promise)
+    internal func terminate() async throws {
+        var errors: [Error] = []
+        for entry in await self.storage.handlers.reversed() {
+            do {
+                try await entry.handler()
+            } catch {
+                errors.append(error)
             }
         }
-
-        // terminate in cascading, reverse order
-        let promise = eventLoop.makePromise(of: Void.self)
-        terminate(self.storage.handlers.reversed().makeIterator(), errors: [], promise: promise)
-        return promise.futureResult
+        
+        if !errors.isEmpty {
+            throw TerminationError(underlying: errors)
+        }
     }
 }
 
 extension LambdaTerminator {
     /// Lambda terminator registration key.
-    public struct RegistrationKey: Hashable, CustomStringConvertible {
+    public struct RegistrationKey: Sendable, Hashable, CustomStringConvertible {
         var value: String
 
         init() {
@@ -99,35 +84,27 @@ extension LambdaTerminator {
 }
 
 extension LambdaTerminator {
-    fileprivate final class Storage {
-        private let lock: NIOLock
+    fileprivate final actor Storage {
         private var index: [RegistrationKey]
         private var map: [RegistrationKey: (name: String, handler: Handler)]
 
         init() {
-            self.lock = .init()
             self.index = []
             self.map = [:]
         }
 
         func add(key: RegistrationKey, name: String, handler: @escaping Handler) {
-            self.lock.withLock {
-                self.index.append(key)
-                self.map[key] = (name: name, handler: handler)
-            }
+            self.index.append(key)
+            self.map[key] = (name: name, handler: handler)
         }
 
         func remove(_ key: RegistrationKey) {
-            self.lock.withLock {
-                self.index = self.index.filter { $0 != key }
-                self.map[key] = nil
-            }
+            self.index = self.index.filter { $0 != key }
+            self.map[key] = nil
         }
 
         var handlers: [(name: String, handler: Handler)] {
-            self.lock.withLock {
-                self.index.compactMap { self.map[$0] }
-            }
+            self.index.compactMap { self.map[$0] }
         }
     }
 }
@@ -137,8 +114,3 @@ extension LambdaTerminator {
         let underlying: [Error]
     }
 }
-
-// Ideally this would not be @unchecked Sendable, but Sendable checks do not understand locks
-// We can transition this to an actor once we drop support for older Swift versions
-extension LambdaTerminator: @unchecked Sendable {}
-extension LambdaTerminator.Storage: @unchecked Sendable {}

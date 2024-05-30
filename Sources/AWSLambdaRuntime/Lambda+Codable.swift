@@ -88,7 +88,7 @@ extension LambdaHandler where Output: Encodable {
 }
 
 // MARK: - EventLoopLambdaHandler Codable support
-
+/*
 /// Implementation of `ByteBuffer` to `Event` decoding.
 extension EventLoopLambdaHandler where Event: Decodable {
     @inlinable
@@ -120,7 +120,7 @@ extension EventLoopLambdaHandler where Output: Encodable {
         Lambda.defaultJSONEncoder
     }
 }
-
+*/
 public protocol LambdaCodableDecoder {
     func decode<T: Decodable>(_ type: T.Type, from buffer: ByteBuffer) throws -> T
 }
