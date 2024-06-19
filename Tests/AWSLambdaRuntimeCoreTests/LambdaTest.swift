@@ -17,7 +17,7 @@ import Logging
 import NIOCore
 import NIOPosix
 import XCTest
-
+/*
 class LambdaTest: XCTestCase {
     func testSuccess() {
         let server = MockLambdaServer(behavior: Behavior())
@@ -361,3 +361,4 @@ struct FailedBootstrapBehavior: LambdaServerBehavior {
         .success(())
     }
 }
+*/

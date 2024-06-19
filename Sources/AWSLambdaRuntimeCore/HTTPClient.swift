@@ -16,6 +16,7 @@ import NIOConcurrencyHelpers
 import NIOCore
 import NIOHTTP1
 import NIOPosix
+import AsyncAlgorithms
 
 /// A barebone HTTP client to interact with AWS Runtime Engine which is an HTTP server.
 /// Note that Lambda Runtime API dictate that only one requests runs at a time.
@@ -38,17 +39,17 @@ internal final class HTTPClient {
         try await self.execute(Request(targetHost: self.targetHost,
                                        url: url,
                                        method: .GET,
-                                       headers: headers,
-                                       timeout: timeout ?? self.configuration.requestTimeout)).get()
+                                       headers: headers),
+                                       timeout: timeout ?? self.configuration.requestTimeout)
     }
 
-    func post(url: String, headers: HTTPHeaders, body: ByteBuffer?, timeout: TimeAmount? = nil) async throws -> Response {
+    func post(url: String, headers: HTTPHeaders, bodyStream: AsyncStream<ByteBuffer>?, timeout: TimeAmount? = nil) async throws -> Response {
         try await self.execute(Request(targetHost: self.targetHost,
                                        url: url,
                                        method: .POST,
-                                       headers: headers,
-                                       body: body,
-                                       timeout: timeout ?? self.configuration.requestTimeout)).get()
+                                       headers: headers),
+                                       bodyStream: bodyStream,
+                                       timeout: timeout ?? self.configuration.requestTimeout)
     }
 
     /// cancels the current request if there is one
@@ -66,7 +67,7 @@ internal final class HTTPClient {
     }
 
     // TODO: cap reconnect attempt
-    private func execute(_ request: Request, validate: Bool = true) -> EventLoopFuture<Response> {
+    private func execute(_ request: Request, bodyStream: AsyncStream<ByteBuffer>? = nil, timeout: TimeAmount?, validate: Bool = true) async throws -> Response {
         if validate {
             precondition(self.executing == false, "expecting single request at a time")
             self.executing = true
@@ -74,28 +75,51 @@ internal final class HTTPClient {
 
         switch self.state {
         case .disconnected:
-            return self.connect().flatMap { channel -> EventLoopFuture<Response> in
-                self.state = .connected(channel)
-                return self.execute(request, validate: false)
-            }
+            let channel = try await connect()
+            
+            self.state = .connected(channel)
+            return try await execute(request, bodyStream: bodyStream, timeout: timeout, validate: false)
         case .connected(let channel):
             guard channel.isActive else {
                 self.state = .disconnected
-                return self.execute(request, validate: false)
+                return try await execute(request, bodyStream: bodyStream, timeout: timeout, validate: false)
             }
 
             let promise = channel.eventLoop.makePromise(of: Response.self)
-            promise.futureResult.whenComplete { _ in
+            
+            var headWritten = false
+            if let bodyStream {
+                for await bodyPart in bodyStream {
+                    // if the head hasn't been written, do so when the first body part is received
+                    if !headWritten {
+                        let headWrapper = HTTPRequestWrapper(part: .head(request), promise: promise)
+                        channel.writeAndFlush(headWrapper).cascadeFailure(to: promise)
+                        
+                        headWritten = true
+                    }
+                    let bodyWrapper = HTTPRequestWrapper(part: .body(bodyPart), promise: promise)
+                    channel.writeAndFlush(bodyWrapper).cascadeFailure(to: promise)
+                }
+            }
+            
+            if !headWritten {
+                let headWrapper = HTTPRequestWrapper(part: .head(request), promise: promise)
+                channel.writeAndFlush(headWrapper).cascadeFailure(to: promise)
+            }
+            
+            let endWrapper = HTTPRequestWrapper(part: .end(timeout: timeout), promise: promise)
+            channel.writeAndFlush(endWrapper).cascadeFailure(to: promise)
+            
+            defer {
                 precondition(self.executing == true, "invalid execution state")
                 self.executing = false
             }
-            let wrapper = HTTPRequestWrapper(request: request, promise: promise)
-            channel.writeAndFlush(wrapper).cascadeFailure(to: promise)
-            return promise.futureResult
+            
+            return try await promise.futureResult.get()
         }
     }
 
-    private func connect() -> EventLoopFuture<Channel> {
+    private func connect() async throws -> Channel {
         let bootstrap = ClientBootstrap(group: self.eventLoop)
             .channelInitializer { channel in
                 do {
@@ -111,13 +135,9 @@ internal final class HTTPClient {
                 }
             }
 
-        do {
-            // connect directly via socket address to avoid happy eyeballs (perf)
-            let address = try SocketAddress(ipAddress: self.configuration.ip, port: self.configuration.port)
-            return bootstrap.connect(to: address)
-        } catch {
-            return self.eventLoop.makeFailedFuture(error)
-        }
+        // connect directly via socket address to avoid happy eyeballs (perf)
+        let address = try SocketAddress(ipAddress: self.configuration.ip, port: self.configuration.port)
+        return try await bootstrap.connect(to: address).get()
     }
 
     internal struct Request: Equatable {
@@ -125,16 +145,14 @@ internal final class HTTPClient {
         let method: HTTPMethod
         let targetHost: String
         let headers: HTTPHeaders
-        let body: ByteBuffer?
-        let timeout: TimeAmount?
+        let bodySize: Int?
 
-        init(targetHost: String, url: String, method: HTTPMethod = .GET, headers: HTTPHeaders = HTTPHeaders(), body: ByteBuffer? = nil, timeout: TimeAmount?) {
+        init(targetHost: String, url: String, method: HTTPMethod = .GET, headers: HTTPHeaders = HTTPHeaders(), bodySize: Int? = nil) {
             self.targetHost = targetHost
             self.url = url
             self.method = method
             self.headers = headers
-            self.body = body
-            self.timeout = timeout
+            self.bodySize = bodySize
         }
     }
 
@@ -158,7 +176,7 @@ internal final class HTTPClient {
 }
 
 // no need in locks since we validate only one request can run at a time
-private final class LambdaChannelHandler: ChannelDuplexHandler {
+private final class LambdaChannelHandler: ChannelDuplexHandler, @unchecked Sendable {
     typealias InboundIn = NIOHTTPClientResponseFull
     typealias OutboundIn = HTTPRequestWrapper
     typealias OutboundOut = HTTPClientRequestPart
@@ -180,36 +198,49 @@ private final class LambdaChannelHandler: ChannelDuplexHandler {
         }
         let wrapper = unwrapOutboundIn(data)
 
-        var head = HTTPRequestHead(
-            version: .http1_1,
-            method: wrapper.request.method,
-            uri: wrapper.request.url,
-            headers: wrapper.request.headers
-        )
-        head.headers.add(name: "host", value: wrapper.request.targetHost)
-        switch head.method {
-        case .POST, .PUT:
-            head.headers.add(name: "content-length", value: String(wrapper.request.body?.readableBytes ?? 0))
-        default:
-            break
-        }
-
-        let timeoutTask = wrapper.request.timeout.map {
-            context.eventLoop.scheduleTask(in: $0) {
-                guard case .running = self.state else {
-                    preconditionFailure("invalid state")
+        switch wrapper.part {
+        case .head(let request):
+            self.state = .running(promise: wrapper.promise, timeout: nil)
+            
+            var head = HTTPRequestHead(
+                version: .http1_1,
+                method: request.method,
+                uri: request.url,
+                headers: request.headers
+            )
+            head.headers.add(name: "host", value: request.targetHost)
+            switch head.method {
+            case .POST, .PUT:
+                if let bodySize = request.bodySize {
+                    head.headers.add(name: "content-length", value: String(bodySize))
                 }
-
-                context.pipeline.fireErrorCaught(HTTPClient.Errors.timeout)
+            default:
+                break
             }
-        }
-        self.state = .running(promise: wrapper.promise, timeout: timeoutTask)
 
-        context.write(wrapOutboundOut(.head(head)), promise: nil)
-        if let body = wrapper.request.body {
-            context.write(wrapOutboundOut(.body(IOData.byteBuffer(body))), promise: nil)
+            context.write(wrapOutboundOut(.head(head)), promise: promise)
+        case .body(let body):
+            self.state = .running(promise: wrapper.promise, timeout: nil)
+            
+            if let body {
+                context.write(wrapOutboundOut(.body(IOData.byteBuffer(body))), promise: promise)
+            }
+        case .end(let timeout):
+            let timeoutTask = timeout.map {
+                let pipeline = context.pipeline
+                return context.eventLoop.scheduleTask(in: $0) {
+                    guard case .running = self.state else {
+                        preconditionFailure("invalid state")
+                    }
+
+                    pipeline.fireErrorCaught(HTTPClient.Errors.timeout)
+                }
+            }
+            
+            self.state = .running(promise: wrapper.promise, timeout: timeoutTask)
+            
+            context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
         }
-        context.writeAndFlush(wrapOutboundOut(.end(nil)), promise: promise)
     }
 
     func channelRead(context: ChannelHandlerContext, data: NIOAny) {
@@ -312,8 +343,14 @@ private final class LambdaChannelHandler: ChannelDuplexHandler {
     }
 }
 
+private enum HTTPRequestPart: Sendable {
+    case head(HTTPClient.Request)
+    case body(ByteBuffer?)
+    case end(timeout: TimeAmount?)
+}
+
 private struct HTTPRequestWrapper {
-    let request: HTTPClient.Request
+    let part: HTTPRequestPart
     let promise: EventLoopPromise<HTTPClient.Response>
 }
 

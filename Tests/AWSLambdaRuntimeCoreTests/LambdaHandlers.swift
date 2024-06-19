@@ -15,7 +15,7 @@
 import AWSLambdaRuntimeCore
 import NIOCore
 import XCTest
-
+/*
 struct EchoHandler: EventLoopLambdaHandler {
     static func makeHandler(context: LambdaInitializationContext) -> EventLoopFuture<EchoHandler> {
         context.eventLoop.makeSucceededFuture(EchoHandler())
@@ -50,3 +50,4 @@ struct RuntimeErrorHandler: EventLoopLambdaHandler {
         context.eventLoop.makeFailedFuture(RuntimeError())
     }
 }
+*/

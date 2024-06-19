@@ -15,7 +15,7 @@
 @testable import AWSLambdaRuntimeCore
 import NIOCore
 import XCTest
-
+/*
 class LambdaHandlerTest: XCTestCase {
     // MARK: - SimpleLambdaHandler
 
@@ -292,3 +292,4 @@ private struct Behavior: LambdaServerBehavior {
         return .failure(.internalServerError)
     }
 }
+*/

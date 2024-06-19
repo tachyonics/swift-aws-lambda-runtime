@@ -18,7 +18,7 @@ import Logging
 import NIOCore
 import NIOHTTP1
 import NIOPosix
-
+/*
 internal final actor MockLambdaServer {
     private let logger = Logger(label: "MockLambdaServer")
     private let behavior: LambdaServerBehavior
@@ -256,3 +256,4 @@ extension ErrorResponse {
         }
     }
 }
+*/

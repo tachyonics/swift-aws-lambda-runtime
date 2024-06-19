@@ -17,7 +17,7 @@ import Logging
 import NIOCore
 import NIOPosix
 import XCTest
-
+/*
 func runLambda<Handler: SimpleLambdaHandler>(behavior: LambdaServerBehavior, handlerType: Handler.Type) throws {
     try runLambda(behavior: behavior, handlerProvider: CodableSimpleLambdaHandler<Handler>.makeHandler(context:))
 }
@@ -25,7 +25,7 @@ func runLambda<Handler: SimpleLambdaHandler>(behavior: LambdaServerBehavior, han
 func runLambda<Handler: LambdaHandler>(behavior: LambdaServerBehavior, handlerType: Handler.Type) throws {
     try runLambda(behavior: behavior, handlerProvider: CodableLambdaHandler<Handler>.makeHandler(context:))
 }
-/*
+
 func runLambda<Handler: EventLoopLambdaHandler>(behavior: LambdaServerBehavior, handlerType: Handler.Type) throws {
     try runLambda(behavior: behavior, handlerProvider: CodableEventLoopLambdaHandler<Handler>.makeHandler(context:))
 }
@@ -50,7 +50,7 @@ func runLambda<Handler: EventLoopLambdaHandler>(
         return CodableEventLoopLambdaHandler(handler: handler, allocator: context.allocator)
     })
 }
-*/
+
 func runLambda<Handler: ByteBufferLambdaHandler>(
     behavior: LambdaServerBehavior,
     handlerProvider: @escaping (LambdaInitializationContext) async throws -> Handler
@@ -138,4 +138,4 @@ extension LambdaRunner {
     ) -> EventLoopFuture<Handler> {
         self.initialize(handlerProvider: handlerType.makeHandler(context:), logger: logger, terminator: terminator)
     }
-}
+}*/

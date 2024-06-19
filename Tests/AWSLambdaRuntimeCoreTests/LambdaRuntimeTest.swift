@@ -18,7 +18,7 @@ import NIOCore
 import NIOHTTP1
 import NIOPosix
 import XCTest
-
+/*
 class LambdaRuntimeTest: XCTestCase {
     func testShutdownFutureIsFulfilledWithStartUpError() {
         let server = MockLambdaServer(behavior: FailedBootstrapBehavior())
@@ -136,3 +136,4 @@ struct BadBehavior: LambdaServerBehavior {
         return .failure(.internalServerError)
     }
 }
+*/

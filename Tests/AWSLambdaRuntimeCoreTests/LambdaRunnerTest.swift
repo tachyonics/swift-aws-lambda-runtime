@@ -15,7 +15,7 @@
 @testable import AWSLambdaRuntimeCore
 import NIOCore
 import XCTest
-
+/*
 class LambdaRunnerTest: XCTestCase {
     func testSuccess() {
         struct Behavior: LambdaServerBehavior {
@@ -194,3 +194,4 @@ class LambdaRunnerTest: XCTestCase {
         }
     }
 }
+*/

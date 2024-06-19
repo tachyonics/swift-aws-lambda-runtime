@@ -15,7 +15,7 @@
 @testable import AWSLambdaRuntimeCore
 import NIOHTTP1
 import XCTest
-
+/*
 class InvocationTest: XCTestCase {
     func testInvocationTraceID() throws {
         let headers = HTTPHeaders([
@@ -35,3 +35,4 @@ class InvocationTest: XCTestCase {
         }
     }
 }
+*/

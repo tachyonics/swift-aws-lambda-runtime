@@ -16,61 +16,54 @@ import Dispatch
 import Logging
 import NIOCore
 
-private struct ByteBufferResponseWriter: ~Copyable, ResponseWriter {
+private struct BodyStreamResponseWriter: ~Copyable, ResponseWriter {
     typealias Output = ByteBuffer?
     
-    private let invocation: Invocation
-    private let runtimeClient: LambdaRuntimeClient
+    private let bodyStreamContinuation: AsyncStream<Result<ByteBuffer?, Error>>.Continuation
     private let logger: Logger
     private var state: State
     
     private enum State {
-        case initialized
+        case writable
         case finalized
     }
     
-    init(invocation: Invocation, runtimeClient: LambdaRuntimeClient, logger: Logger) {
-        self.invocation = invocation
-        self.runtimeClient = runtimeClient
+    init(bodyStreamContinuation: AsyncStream<Result<ByteBuffer?, Error>>.Continuation, logger: Logger) {
+        self.bodyStreamContinuation = bodyStreamContinuation
         self.logger = logger
-        self.state = .initialized
-    }
-    
-    private mutating func reportResults(_ result: Result<ByteBuffer?, Error>) async {
-        // 3. report results to runtime engine
-        do {
-            try await self.runtimeClient.reportResults(logger: logger, invocation: invocation, result: result)
-        } catch {
-            logger.error("could not report results to lambda runtime engine: \(error)")
-        }
-        
-        state = .finalized
+        self.state = .writable
     }
     
     internal mutating func finalizeIfRequired() async {
-        guard case .initialized = state else {
+        guard case .writable = state else {
             return
         }
 
-        await reportResults(.success(nil))
+        self.bodyStreamContinuation.finish()
     }
     
     mutating func submit(value: ByteBuffer?) async {
-        guard case .initialized = state else {
-            fatalError("Response provided multiple times.")
+        guard case .writable = state else {
+            fatalError("ByteBuffer submitted to finalized BodyStreamResponseWriter")
         }
 
-        await reportResults(.success(value))
+        self.bodyStreamContinuation.yield(.success(value))
     }
     
     mutating func submit(error: Swift.Error) async {
-        guard case .initialized = state else {
-            fatalError("Response provided multiple times.")
+        guard case .writable = state else {
+            fatalError("Error submitted to finalized BodyStreamResponseWriter")
         }
         
         logger.warning("lambda handler returned an error: \(error)")
-        await reportResults(.failure(error))
+        self.bodyStreamContinuation.yield(.failure(error))
     }
+}
+
+struct LambdaInvocationContext {
+    let buffer: ByteBuffer
+    let context: LambdaContext
+    let bodyStreamContinuation: AsyncStream<Result<ByteBuffer?, Error>>.Continuation
 }
 
 /// LambdaRunner manages the Lambda runtime workflow, or business logic.
@@ -157,6 +150,22 @@ internal final class LambdaRunner {
         } catch {
             await responseWriter.submit(error: error)
         }
+    }
+    
+    func handleInvocations(handler: some LambdaRuntimeHandler, invocationStream: AsyncStream<LambdaInvocationContext>, logger: Logger) async throws {
+        // iterate through the invocation stream
+        for await invocationContext in invocationStream {
+            var responseWriter = BodyStreamResponseWriter(bodyStreamContinuation: invocationContext.bodyStreamContinuation, logger: logger)
+            
+            do {
+                try await handler.handle(invocationContext.buffer, context: invocationContext.context, responseWriter: &responseWriter)
+            } catch {
+                await responseWriter.submit(error: error)
+            }
+            
+            await responseWriter.finalizeIfRequired()
+        }
+        
     }
 
     /// cancels the current run, if we are waiting for next invocation (long poll from Lambda control plane)
